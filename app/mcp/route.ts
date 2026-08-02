@@ -47,6 +47,11 @@ function stripHtml(html: string): string {
   return text;
 }
 
+// 표 셀 안쪽 HTML을 사람이 읽는 텍스트로 정리(줄바꿈 없는 짧은 텍스트 전용, stripHtml과 별도).
+function stripHtmlInline(s: string): string {
+  return (s || "").replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim();
+}
+
 function xmlTag(xml: string, tag: string): string | null {
   const re = new RegExp(`<${tag}[^>]*>\\s*(?:<value>)?([^<]*)`, "i");
   const m = xml.match(re);
@@ -83,6 +88,60 @@ function previewAt(text: string, idx: number, keywordLen: number): string {
   return text.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
+// 공시 index 페이지("Document Format Files" 표)를 파싱해서 그 공시에 포함된 모든 파일
+// (본문 + Exhibit + 그래픽 등)의 목록을 구조화한다.
+// (2026-08-02 추가: get_filing_section/get_executive_compensation이 본문(primaryDocument)
+//  1개 파일만 조회하고 별도 첨부(Exhibit, 예: EX-21.1 자회사목록, EX-10.1 계약서 등)는
+//  구조적으로 조회하지 못하던 것을 보완. KRX 별표 사고와 동일한 유형 — 다만 KRX와 달리
+//  이 데이터는 사용자가 별도 저장해둔 것이 아니라 SEC가 공개 제공하는 index 페이지에서
+//  바로 조회 가능하므로, Qdrant 등 별도 저장소 없이 SEC 서버에서 실시간으로 가져온다.)
+interface FilingDocument {
+  seq: string;
+  description: string;
+  filename: string | null;
+  url: string;
+  type: string;
+  size: string;
+  isExhibit: boolean;
+}
+
+function parseFilingIndexTable(html: string): FilingDocument[] {
+  const tableMatch = html.match(
+    /Document Format Files[\s\S]*?<table[^>]*>([\s\S]*?)<\/table>/i
+  );
+  if (!tableMatch) return [];
+  const tableHtml = tableMatch[1];
+  const rows = tableHtml.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+  const docs: FilingDocument[] = [];
+  for (const row of rows) {
+    const cells = row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi);
+    if (!cells || cells.length < 4) continue;
+    const cellTexts = cells.map((c) =>
+      c.replace(/<td[^>]*>/i, "").replace(/<\/td>/i, "")
+    );
+    const [seqCell, descCell, docCell, typeCell, sizeCell] = cellTexts;
+    const hrefMatch = docCell.match(/href="([^"]+)"/i);
+    if (!hrefMatch) continue; // 링크 없는 행(헤더 등)은 건너뜀
+    let href = hrefMatch[1];
+    href = href.replace(/^\/ix\?doc=/, ""); // iXBRL 뷰어 링크 정리 → 실제 문서 경로만 남김
+    const url = href.startsWith("http") ? href : `https://www.sec.gov${href}`;
+    const filenameMatch = docCell.match(/>([^<]+\.[a-zA-Z0-9]+)\s*</);
+    const type = stripHtmlInline(typeCell);
+    docs.push({
+      seq: stripHtmlInline(seqCell),
+      description: stripHtmlInline(descCell),
+      filename: filenameMatch ? filenameMatch[1] : null,
+      url,
+      type,
+      size: stripHtmlInline(sizeCell || ""),
+      isExhibit: /^EX-/i.test(type.trim()),
+    });
+  }
+  // 그래픽(이미지)과 전체제출 텍스트파일(원본 그대로라 개별 문서보다 훨씬 크고 중복)은
+  // 실무상 유용성이 낮아 기본 목록에서 제외한다.
+  return docs.filter((d) => d.type !== "GRAPHIC" && d.filename && !d.filename.endsWith(".txt"));
+}
+
 let tickerCache: any[] | null = null;
 let tickerCacheTime = 0;
 
@@ -107,18 +166,24 @@ async function getSubmissions(cik: string) {
 function buildFilingRows(data: any, paddedCik: string) {
   const recent = data.filings?.recent;
   if (!recent) return [];
-  return recent.form.map((form: string, i: number) => ({
-    form,
-    filingDate: recent.filingDate[i],
-    accessionNumber: recent.accessionNumber[i],
-    primaryDocument: recent.primaryDocument[i],
-    reportUrl: `https://www.sec.gov/Archives/edgar/data/${parseInt(
-      paddedCik,
-      10
-    )}/${recent.accessionNumber[i].replace(/-/g, "")}/${
-      recent.primaryDocument[i]
-    }`,
-  }));
+  return recent.form.map((form: string, i: number) => {
+    const numericCik = parseInt(paddedCik, 10);
+    const accessionNoDashes = recent.accessionNumber[i].replace(/-/g, "");
+    return {
+      form,
+      filingDate: recent.filingDate[i],
+      accessionNumber: recent.accessionNumber[i],
+      primaryDocument: recent.primaryDocument[i],
+      reportUrl: `https://www.sec.gov/Archives/edgar/data/${numericCik}/${accessionNoDashes}/${recent.primaryDocument[i]}`,
+      // 이 공시에 포함된 모든 문서(본문+Exhibit) 목록은 list_filing_documents로 조회.
+      indexUrl: `https://www.sec.gov/Archives/edgar/data/${numericCik}/${accessionNoDashes}/${recent.accessionNumber[i]}-index.htm`,
+    };
+  });
+}
+
+async function fetchFilingDocuments(indexUrl: string): Promise<FilingDocument[]> {
+  const html = await secFetchText(indexUrl);
+  return parseFilingIndexTable(html);
 }
 
 const handler = createMcpHandler(
@@ -152,7 +217,10 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_company_filings",
-      "CIK 번호로 회사의 최근 SEC 공시 목록(10-K, 10-Q, 8-K, 20-F 등)을 조회합니다.",
+      "CIK 번호로 회사의 최근 SEC 공시 목록(10-K, 10-Q, 8-K, 20-F 등)을 조회합니다. 각 건의 " +
+        "reportUrl은 본문(primary document) 1개 파일만 가리키며, 그 공시에 딸린 첨부 " +
+        "(Exhibit, 예: EX-10.1 계약서, EX-21.1 자회사목록)까지 보려면 같이 반환되는 indexUrl을 " +
+        "list_filing_documents에 넣어 전체 문서 목록을 확인하세요.",
       {
         cik: z
           .string()
@@ -281,10 +349,87 @@ const handler = createMcpHandler(
     );
 
     server.tool(
-      "get_filing_section",
-      "10-K, 20-F, 8-K 등 공시 원문 문서에서 특정 섹션(예: 위험요소, 지분구조, 재무제표 주석)만 추출합니다. keyword를 생략하면 문서 내 주요 Item/섹션 목차를 반환합니다. url은 get_company_filings 결과의 reportUrl을 사용하세요. 같은 keyword가 문서 내 여러 곳(목차 + 실제 본문)에 나오면, 각 위치의 짧은 미리보기 목록을 먼저 반환합니다 — 그중 원하는 위치의 번호를 occurrenceIndex로 다시 지정해서 호출하세요.",
+      "list_filing_documents",
+      "특정 공시(accession)에 포함된 전체 문서 목록(본문 1개 + Exhibit·첨부 여러 개)을 SEC " +
+        "EDGAR의 공시 index 페이지에서 실시간으로 가져옵니다. get_company_filings/full_text_search " +
+        "결과의 indexUrl(또는 reportUrl에서 파일명만 다른 -index.htm URL)을 입력하세요. " +
+        "get_filing_section·get_executive_compensation이 본문에서 키워드를 못 찾았을 때, " +
+        "그 내용이 이 목록의 Exhibit(EX-10.1 계약서, EX-21.1 자회사목록, EX-99.1 보도자료 등) " +
+        "중 하나에 있는 것은 아닌지 먼저 이 도구로 확인하세요 — 첨부는 별도 파일이라 본문 " +
+        "조회 도구가 애초에 그 내용을 보지 못합니다. 원하는 Exhibit을 찾으면 그 url을 다시 " +
+        "get_filing_section의 url 파라미터에 넣어 내용을 조회하면 됩니다.",
       {
-        url: z.string().describe("문서 URL (get_company_filings의 reportUrl)"),
+        indexUrl: z
+          .string()
+          .describe(
+            "공시 index 페이지 URL (get_company_filings/full_text_search 결과의 indexUrl/filingIndexUrl)"
+          ),
+      },
+      async ({ indexUrl }) => {
+        if (!indexUrl.startsWith("https://www.sec.gov/")) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "보안상 sec.gov 도메인의 URL만 조회할 수 있습니다.",
+              },
+            ],
+          };
+        }
+        const docs = await fetchFilingDocuments(indexUrl);
+        if (docs.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "문서 목록을 찾지 못했습니다. indexUrl이 '...-index.htm' 형식인지 확인하세요 " +
+                  "(개별 문서 URL이 아니라 공시 전체의 색인 페이지여야 합니다).",
+              },
+            ],
+          };
+        }
+        const primary = docs.filter((d) => !d.isExhibit);
+        const exhibits = docs.filter((d) => d.isExhibit);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  primaryDocuments: primary,
+                  exhibits,
+                  note:
+                    exhibits.length > 0
+                      ? `이 공시에는 본문 외에 첨부(Exhibit) ${exhibits.length}건이 있습니다. get_filing_section에서 본문 조회로 원하는 내용을 못 찾았다면 이 exhibits 목록의 url로 다시 조회해보세요.`
+                      : "이 공시에는 별도 Exhibit이 없습니다.",
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    );
+
+    server.tool(
+      "get_filing_section",
+      "10-K, 20-F, 8-K 등 공시 문서 하나에서 특정 섹션(예: 위험요소, 지분구조, 재무제표 주석)만 " +
+        "추출합니다. keyword를 생략하면 문서 내 주요 Item/섹션 목차를 반환합니다. url은 " +
+        "get_company_filings 결과의 reportUrl(본문) 또는 list_filing_documents 결과의 " +
+        "특정 Exhibit url을 사용하세요. ⚠️ 이 도구는 url로 지정한 문서 1개만 조회하며, 같은 " +
+        "공시에 딸린 다른 첨부(Exhibit)는 조회하지 않습니다 — keyword를 못 찾았다고 해서 " +
+        "그 내용이 공시 전체에 없다는 뜻은 아닙니다. 다른 Exhibit에 있을 수 있으니 먼저 " +
+        "list_filing_documents로 그 공시의 전체 문서 목록을 확인하세요. 같은 keyword가 문서 " +
+        "내 여러 곳(목차 + 실제 본문)에 나오면, 각 위치의 짧은 미리보기 목록을 먼저 반환합니다 " +
+        "— 그중 원하는 위치의 번호를 occurrenceIndex로 다시 지정해서 호출하세요.",
+      {
+        url: z
+          .string()
+          .describe(
+            "문서 URL (get_company_filings의 reportUrl 또는 list_filing_documents 결과의 exhibit url)"
+          ),
         keyword: z
           .string()
           .optional()
@@ -344,7 +489,11 @@ const handler = createMcpHandler(
             content: [
               {
                 type: "text",
-                text: `'${keyword}' 키워드를 문서에서 찾지 못했습니다. keyword 없이 다시 호출해 목차를 확인해보세요.`,
+                text:
+                  `'${keyword}' 키워드를 이 문서에서 찾지 못했습니다. 이 도구는 url로 지정한 ` +
+                  `문서 1개만 봅니다 — 같은 공시의 다른 Exhibit(첨부)에 있을 수 있으니, ` +
+                  `list_filing_documents로 이 공시의 전체 문서 목록을 먼저 확인해보세요. ` +
+                  `아니면 keyword 없이 이 도구를 다시 호출해 이 문서의 목차부터 확인해보세요.`,
               },
             ],
           };
@@ -442,7 +591,9 @@ const handler = createMcpHandler(
     );
     server.tool(
       "full_text_search",
-      "SEC EDGAR에 제출된 모든 상장사의 공시 원문을 키워드로 통합 검색합니다 (DART의 공시 통합검색과 유사). 특정 회사를 몰라도 키워드만으로 시장 전체를 검색할 수 있습니다.",
+      "SEC EDGAR에 제출된 모든 상장사의 공시 원문을 키워드로 통합 검색합니다 (DART의 공시 통합검색과 유사). " +
+        "특정 회사를 몰라도 키워드만으로 시장 전체를 검색할 수 있습니다. 결과의 filingIndexUrl을 " +
+        "list_filing_documents에 넣으면 그 공시의 본문+Exhibit 전체 목록을 볼 수 있습니다.",
       {
         query: z
           .string()
@@ -568,7 +719,11 @@ const handler = createMcpHandler(
 
     server.tool(
       "get_executive_compensation",
-      "가장 최근 주주총회소집통지(DEF 14A Proxy Statement)에서 임원보수 관련 섹션(Summary Compensation Table 등) 원문을 추출합니다. keyword가 문서 내 여러 곳(목차 + 실제 데이터표 + 부록 등)에 나오면 각 위치의 짧은 미리보기 목록을 먼저 반환하니, 원하는 위치 번호를 occurrenceIndex로 지정해서 다시 호출하세요.",
+      "가장 최근 주주총회소집통지(DEF 14A Proxy Statement)에서 임원보수 관련 섹션(Summary " +
+        "Compensation Table 등) 원문을 추출합니다. keyword가 문서 내 여러 곳(목차 + 실제 " +
+        "데이터표 + 부록 등)에 나오면 각 위치의 짧은 미리보기 목록을 먼저 반환하니, 원하는 " +
+        "위치 번호를 occurrenceIndex로 지정해서 다시 호출하세요. DEF 14A는 보통 단일 문서지만, " +
+        "찾는 내용이 없으면 list_filing_documents로 이 공시에 다른 첨부가 있는지도 확인하세요.",
       {
         cik: z.string().describe("10자리 CIK 번호 또는 숫자"),
         keyword: z
@@ -615,7 +770,11 @@ const handler = createMcpHandler(
             content: [
               {
                 type: "text",
-                text: `'${keyword}' 키워드를 최근 DEF 14A(제출일 ${latest.filingDate})에서 찾지 못했습니다. get_filing_section 도구로 문서 목차를 먼저 확인해보세요. 문서 URL: ${latest.reportUrl}`,
+                text:
+                  `'${keyword}' 키워드를 최근 DEF 14A(제출일 ${latest.filingDate})에서 찾지 ` +
+                  `못했습니다. get_filing_section 도구로 이 문서의 목차를 먼저 확인해보거나, ` +
+                  `list_filing_documents(indexUrl="${latest.indexUrl}")로 이 공시에 다른 첨부가 ` +
+                  `있는지 확인해보세요. 문서 URL: ${latest.reportUrl}`,
               },
             ],
           };
