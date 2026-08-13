@@ -172,6 +172,8 @@ function buildFilingRows(data: any, paddedCik: string) {
     return {
       form,
       filingDate: recent.filingDate[i],
+      // 제출일(filingDate)과 별개인 '보고기준일'. 13F-HR의 분기말 등 기준시점 판단에 필요.
+      reportDate: recent.reportDate?.[i] || null,
       accessionNumber: recent.accessionNumber[i],
       primaryDocument: recent.primaryDocument[i],
       reportUrl: `https://www.sec.gov/Archives/edgar/data/${numericCik}/${accessionNoDashes}/${recent.primaryDocument[i]}`,
@@ -184,6 +186,75 @@ function buildFilingRows(data: any, paddedCik: string) {
 async function fetchFilingDocuments(indexUrl: string): Promise<FilingDocument[]> {
   const html = await secFetchText(indexUrl);
   return parseFilingIndexTable(html);
+}
+
+// ─── 13F-HR 보유내역(INFORMATION TABLE) 파싱 ────────────────────────────────
+// (2026-08-13 추가) 기관투자자의 분기말 미국주식 보유내역. xmlTag()는 여는 태그 뒤
+// 텍스트만 잘라내므로 <votingAuthority><Sole>…</Sole></votingAuthority> 같은 중첩
+// 구조를 못 읽는다. 그래서 여는/닫는 태그 쌍으로 블록 전체를 잡는 별도 헬퍼를 쓴다.
+// 네임스페이스 프리픽스(ns1:infoTable 등)가 붙어 오는 제출인도 있어 함께 허용한다.
+function xmlBlock(source: string, tag: string): string | null {
+  const re = new RegExp(
+    `<(?:\\w+:)?${tag}[^>]*>([\\s\\S]*?)<\\/(?:\\w+:)?${tag}>`,
+    "i"
+  );
+  const m = source.match(re);
+  return m ? m[1].trim() : null;
+}
+
+interface Holding {
+  nameOfIssuer: string | null;
+  titleOfClass: string | null;
+  cusip: string | null;
+  value: number;
+  shares: number;
+  sharesType: string | null;
+  investmentDiscretion: string | null;
+  votingSole: number;
+  votingShared: number;
+  votingNone: number;
+  lineItems?: number;
+}
+
+function parseInformationTable(xml: string): Holding[] {
+  const blocks =
+    xml.match(/<(?:\w+:)?infoTable[\s>][\s\S]*?<\/(?:\w+:)?infoTable>/gi) || [];
+  return blocks.map((b) => {
+    const va = xmlBlock(b, "votingAuthority") || "";
+    return {
+      nameOfIssuer: xmlBlock(b, "nameOfIssuer"),
+      titleOfClass: xmlBlock(b, "titleOfClass"),
+      cusip: xmlBlock(b, "cusip"),
+      value: Number(xmlBlock(b, "value") || 0),
+      shares: Number(xmlBlock(b, "sshPrnamt") || 0),
+      sharesType: xmlBlock(b, "sshPrnamtType"),
+      investmentDiscretion: xmlBlock(b, "investmentDiscretion"),
+      votingSole: Number(xmlBlock(va, "Sole") || 0),
+      votingShared: Number(xmlBlock(va, "Shared") || 0),
+      votingNone: Number(xmlBlock(va, "None") || 0),
+    };
+  });
+}
+
+// 같은 종목이 운용역(otherManager)·재량구분별로 여러 행에 나뉘어 보고되는 것이 정상이다
+// (버크셔 1개 분기 90행 → 종목 기준 29개). 종목 단위로 합산해야 실제 포지션이 보인다.
+function consolidateHoldings(items: Holding[]): Holding[] {
+  const map = new Map<string, Holding>();
+  for (const it of items) {
+    const key = `${it.cusip}|${it.titleOfClass}`;
+    const prev = map.get(key);
+    if (prev) {
+      prev.value += it.value;
+      prev.shares += it.shares;
+      prev.votingSole += it.votingSole;
+      prev.votingShared += it.votingShared;
+      prev.votingNone += it.votingNone;
+      prev.lineItems = (prev.lineItems || 1) + 1;
+    } else {
+      map.set(key, { ...it, lineItems: 1 });
+    }
+  }
+  return Array.from(map.values());
 }
 
 const handler = createMcpHandler(
@@ -810,6 +881,289 @@ const handler = createMcpHandler(
                   filingDate: latest.filingDate,
                   sourceUrl: latest.reportUrl,
                   excerpt: snippet,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    );
+
+    server.tool(
+      "get_institutional_holdings",
+      "기관투자자(자산운용사·헤지펀드·연기금·은행 등)가 제출한 Form 13F-HR의 분기말 미국주식 " +
+        "보유내역을 조회합니다. cik에는 **조회 대상 기관투자자의 CIK**를 넣습니다 (예: 버크셔 " +
+        "해서웨이 1067983, 뱅가드·블랙록 등). 보유 종목명·CUSIP·평가액·보유주식수·의결권 구분이 " +
+        "반환됩니다. ⚠️ 일반 사업회사의 CIK를 넣으면 조회되지 않습니다 — 13F는 미국주식 운용자산 " +
+        "1억달러 이상 기관투자자만 제출하는 서식이라, '이 회사의 주주가 누구인가'(역방향)를 보려면 " +
+        "get_major_shareholders(13D/13G, 5% 이상 주주)를 사용하세요. 같은 종목이 운용역별로 여러 " +
+        "행에 나뉘어 보고되므로 기본값(consolidate=true)은 종목 단위로 합산해서 반환합니다.",
+      {
+        cik: z
+          .string()
+          .describe(
+            "기관투자자(13F 제출인)의 10자리 CIK 번호 또는 숫자 (search_company로 확보)"
+          ),
+        limit: z.coerce
+          .number()
+          .optional()
+          .default(50)
+          .describe("반환할 보유종목 수 (평가액 큰 순). 전체 종목 수는 totalPositions로 확인"),
+        filingIndex: z.coerce
+          .number()
+          .optional()
+          .default(0)
+          .describe(
+            "조회할 13F-HR 회차. 0이 최신 분기, 1이 직전 분기…(분기별 변동 추적 시 사용)"
+          ),
+        consolidate: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            "같은 종목(CUSIP)이 여러 행으로 나뉘어 보고된 것을 합산할지 여부. false면 원문 행을 그대로 반환"
+          ),
+        issuerContains: z
+          .string()
+          .optional()
+          .describe("특정 종목만 필터링 (발행회사명 부분일치, 예: 'apple')"),
+      },
+      async ({ cik, limit, filingIndex, consolidate, issuerContains }) => {
+        const paddedCik = pad10(cik);
+        const data = await getSubmissions(paddedCik);
+        const rows = buildFilingRows(data, paddedCik).filter((r: any) =>
+          normalizeForm(r.form).startsWith("13F-HR")
+        );
+        if (rows.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `CIK ${paddedCik}(${data.name})로 제출된 13F-HR 공시를 찾지 못했습니다. ` +
+                  `13F-HR은 미국주식 운용자산 1억달러 이상인 기관투자자만 제출하는 서식이므로, ` +
+                  `일반 사업회사 CIK로는 조회되지 않습니다. 반대로 '이 회사의 주요주주가 누구인가'를 ` +
+                  `보시려면 get_major_shareholders(13D/13G)를 사용하세요.`,
+              },
+            ],
+          };
+        }
+
+        const row = rows[Math.min(Math.max(filingIndex, 0), rows.length - 1)];
+        const docs = await fetchFilingDocuments(row.indexUrl);
+        // index 표에는 같은 문서가 XSL 뷰어 경로와 원본 XML 경로로 2번 나온다. 원본을 우선한다.
+        const info =
+          docs.find(
+            (d) => /INFORMATION TABLE/i.test(d.type) && !/xslForm13F/i.test(d.url)
+          ) || docs.find((d) => /INFORMATION TABLE/i.test(d.type));
+        if (!info) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `이 13F-HR 공시(제출일 ${row.filingDate})에서 INFORMATION TABLE 문서를 ` +
+                  `찾지 못했습니다. list_filing_documents(indexUrl="${row.indexUrl}")로 ` +
+                  `이 공시의 전체 문서 목록을 직접 확인해보세요. 보유내역 없이 표지만 제출하는 ` +
+                  `13F-NT(Notice)일 수도 있습니다.`,
+              },
+            ],
+          };
+        }
+
+        const xmlUrl = info.url.replace(/xslForm13F_X\d+\//, "");
+        let items = parseInformationTable(await secFetchText(xmlUrl));
+        if (items.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `INFORMATION TABLE 파싱 결과가 0건입니다. 원문을 직접 확인하세요: ${xmlUrl}`,
+              },
+            ],
+          };
+        }
+        if (consolidate) items = consolidateHoldings(items);
+        if (issuerContains) {
+          const q = issuerContains.toLowerCase();
+          items = items.filter((i) =>
+            (i.nameOfIssuer || "").toLowerCase().includes(q)
+          );
+        }
+        const totalValue = items.reduce((s, i) => s + i.value, 0);
+        items.sort((a, b) => b.value - a.value);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  filerName: data.name,
+                  cik: paddedCik,
+                  form: row.form,
+                  filingDate: row.filingDate,
+                  reportPeriod: row.reportDate,
+                  availableFilings: rows.length,
+                  consolidated: consolidate,
+                  totalPositions: items.length,
+                  totalValue,
+                  valueUnitNote:
+                    "value는 SEC 규정 개정에 따라 2023년 이후 제출분부터 '달러 단위'로 보고됩니다(그 이전 제출분은 '천달러 단위'). reportPeriod를 확인해 해석하세요.",
+                  sourceUrl: xmlUrl,
+                  filingIndexUrl: row.indexUrl,
+                  holdings: items.slice(0, limit),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    );
+
+    server.tool(
+      "fetch_frames",
+      "XBRL Frames API — 특정 재무항목 1개를 **전체 미국 상장사 횡단**으로 한 번에 조회합니다. " +
+        "회사별로 하나씩 조회하는 get_company_facts와 반대 방향이며, 동종업계 피어그룹 스크리닝· " +
+        "업종 벤치마킹·순위 산출에 사용합니다 (예: 'CY2024 매출 상위 기업', '2024년말 총자산 " +
+        "규모 비교'). period 형식이 항목 성격에 따라 다르니 주의하세요 — 재무상태표 항목(자산· " +
+        "부채·자본 등 시점 값)은 'CY2024Q1I'처럼 끝에 I를 붙이고 분기 단위만 지원하며, 손익· " +
+        "현금흐름 항목(매출·이익 등 기간 값)은 'CY2024Q1'(분기) 또는 'CY2024'(연간)를 씁니다. " +
+        "형식이 틀려 404가 나면 I를 붙이거나 뗀 형태로 자동 재시도하고 결과에 periodUsed로 알려줍니다. " +
+        "concept명을 모르면 get_company_facts를 concept 없이 호출해 그 회사의 항목 목록부터 확인하세요.",
+      {
+        concept: z
+          .string()
+          .describe(
+            "XBRL 항목명 (대소문자 구분, 예: Assets, Liabilities, Revenues, NetIncomeLoss, StockholdersEquity, OperatingIncomeLoss)"
+          ),
+        period: z
+          .string()
+          .describe(
+            "조회 기간. 시점항목(재무상태표)은 'CY2024Q1I'·'CY2024Q4I'처럼 I 접미사 + 분기만 가능. 기간항목(손익)은 'CY2024Q1'(분기) 또는 'CY2024'(연간)"
+          ),
+        unit: z
+          .string()
+          .optional()
+          .default("USD")
+          .describe("단위 (기본 USD. 주식수는 'shares', 주당금액은 'USD-per-shares')"),
+        taxonomy: z
+          .string()
+          .optional()
+          .default("us-gaap")
+          .describe("분류체계 (기본 us-gaap. 그 밖에 ifrs-full, dei)"),
+        limit: z.coerce
+          .number()
+          .optional()
+          .default(50)
+          .describe(
+            "반환할 기업 수. 프레임 전체 기업 수는 totalCompaniesInFrame으로 확인 (수천 건이므로 전량 반환하지 않음)"
+          ),
+        sort: z
+          .enum(["desc", "asc"])
+          .optional()
+          .default("desc")
+          .describe("값 기준 정렬. desc=큰 순(기본), asc=작은 순"),
+        nameContains: z
+          .string()
+          .optional()
+          .describe(
+            "기업명 부분일치 필터 (예: 'motor'). 특정 기업 몇 곳만 골라 비교할 때 사용"
+          ),
+      },
+      async ({ concept, period, unit, taxonomy, limit, sort, nameContains }) => {
+        // 요청 형식 그대로 먼저 시도하고, 404면 I 접미사를 토글해서 한 번 더 시도한다.
+        const candidates = [period];
+        candidates.push(
+          /I$/.test(period) ? period.replace(/I$/, "") : `${period}I`
+        );
+
+        let data: any = null;
+        let usedPeriod: string | null = null;
+        const errors: string[] = [];
+        for (const p of candidates) {
+          const url = `https://data.sec.gov/api/xbrl/frames/${taxonomy}/${concept}/${unit}/${p}.json`;
+          const res = await fetch(url, {
+            headers: {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+            },
+          });
+          if (res.ok) {
+            data = await res.json();
+            usedPeriod = p;
+            break;
+          }
+          errors.push(`${p}: HTTP ${res.status}`);
+        }
+
+        if (!data) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `프레임 데이터를 찾지 못했습니다 (${errors.join(", ")}).\n` +
+                  `확인사항\n` +
+                  `1) concept 철자 — 대소문자를 구분합니다 (예: Assets, Revenues, NetIncomeLoss). ` +
+                  `정확한 항목명은 get_company_facts를 concept 없이 호출해 확인하세요.\n` +
+                  `2) period 형식 — 시점항목(자산·부채·자본)은 'CY2024Q1I'처럼 I를 붙이고 분기만 지원, ` +
+                  `기간항목(매출·이익)은 'CY2024Q1' 또는 'CY2024'.\n` +
+                  `3) unit — 금액은 USD, 주식수는 shares, 주당금액은 USD-per-shares.\n` +
+                  `4) taxonomy — us-gaap / ifrs-full / dei.\n` +
+                  `5) 해당 분기 프레임 자체가 아직 생성되지 않았을 수 있습니다(최근 분기는 공시가 ` +
+                  `충분히 쌓인 뒤 제공).`,
+              },
+            ],
+          };
+        }
+
+        const all: any[] = data.data || [];
+        let rows = all;
+        if (nameContains) {
+          const q = nameContains.toLowerCase();
+          rows = rows.filter((d) =>
+            (d.entityName || "").toLowerCase().includes(q)
+          );
+        }
+        const matched = rows.length;
+        rows = [...rows]
+          .sort((a, b) => (sort === "asc" ? a.val - b.val : b.val - a.val))
+          .slice(0, limit);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  taxonomy: data.taxonomy,
+                  tag: data.tag,
+                  label: data.label,
+                  unit: data.uom,
+                  periodRequested: period,
+                  periodUsed: usedPeriod,
+                  autoCorrected:
+                    usedPeriod !== period
+                      ? `요청하신 '${period}' 프레임이 없어 '${usedPeriod}'로 자동 대체 조회했습니다. ` +
+                        `(시점항목/기간항목 구분에 따른 형식 차이)`
+                      : undefined,
+                  totalCompaniesInFrame: all.length,
+                  matchedAfterFilter: matched,
+                  returned: rows.length,
+                  data: rows.map((d) => ({
+                    cik: pad10(d.cik),
+                    entityName: d.entityName,
+                    loc: d.loc,
+                    start: d.start,
+                    end: d.end,
+                    val: d.val,
+                    accn: d.accn,
+                  })),
                 },
                 null,
                 2
