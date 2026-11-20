@@ -8,13 +8,45 @@ function pad10(cik: string | number): string {
   return String(cik).replace(/\D/g, "").padStart(10, "0");
 }
 
+// SEC 요청: 연결 실패·HTTP 5xx는 잠깐 쉬고 최대 3회 받는다(429·4xx는 그대로).
+// 2026-11-20 04:24 full_text_search(efts) HTTP 500 1회, 같은 검색 재호출 정상 — 원천 일시 오류였다.
+// 시도당 20초 제한(전에는 제한 없음).
+async function secFetch(url: string): Promise<Response> {
+  let lastErr: unknown = null;
+  let lastRes: Response | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 20000);
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate" },
+        signal: ac.signal,
+      });
+      if (res.status >= 500 && attempt < 2) {
+        lastRes = res;
+        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if ((e as Error).name === "AbortError" || attempt === 2) break;
+      await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (lastRes) return lastRes;
+  const e = lastErr as Error;
+  throw new Error(
+    e && e.name === "AbortError"
+      ? `SEC 응답이 20초 안에 오지 않았습니다 (${url})`
+      : `SEC 연결 실패: ${e && e.message} (3회 시도, ${url})`
+  );
+}
+
 async function secFetchJson(url: string) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Encoding": "gzip, deflate",
-    },
-  });
+  const res = await secFetch(url);
   if (!res.ok) {
     throw new Error(`SEC API 오류: ${res.status} ${res.statusText} (${url})`);
   }
@@ -22,12 +54,7 @@ async function secFetchJson(url: string) {
 }
 
 async function secFetchText(url: string) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Encoding": "gzip, deflate",
-    },
-  });
+  const res = await secFetch(url);
   if (!res.ok) {
     throw new Error(`SEC API 오류: ${res.status} ${res.statusText} (${url})`);
   }
@@ -1087,12 +1114,7 @@ const handler = createMcpHandler(
         const errors: string[] = [];
         for (const p of candidates) {
           const url = `https://data.sec.gov/api/xbrl/frames/${taxonomy}/${concept}/${unit}/${p}.json`;
-          const res = await fetch(url, {
-            headers: {
-              "User-Agent": USER_AGENT,
-              "Accept-Encoding": "gzip, deflate",
-            },
-          });
+          const res = await secFetch(url);
           if (res.ok) {
             data = await res.json();
             usedPeriod = p;
